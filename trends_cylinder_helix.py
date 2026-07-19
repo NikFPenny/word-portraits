@@ -6,9 +6,10 @@ and maps that average onto a helix wrapped around a cylinder.
 
 Pipeline:
     words + date range  -->  Google Trends (via pytrends)  -->  averaged
-    0-100 interest series, sampled every 2 months  -->  helix coordinates
-    (one revolution per year, radius driven by trend strength)  -->
-    x/y values rescaled into a fixed 0-15 range  -->  JSON
+    0-100 interest series, resampled to either weekly points or a fixed
+    point count  -->  helix coordinates (evenly spread over N total
+    revolutions, radius driven by trend strength)  -->
+    x/y values rescaled about the origin  -->  JSON
 
 Requires: pip install pytrends pandas --break-system-packages
 
@@ -242,28 +243,46 @@ def load_trends_from_csv(
 
 
 # ---------------------------------------------------------------------------
-# 2. Resampling to exact weekly points
+# 2. Resampling to a target set of points
 # ---------------------------------------------------------------------------
 
-def resample_weekly(series: pd.Series, start_date: str, end_date: str) -> pd.Series:
+def resample_series(
+    series: pd.Series,
+    start_date: str,
+    end_date: str,
+    num_points: Optional[int] = None,
+) -> pd.Series:
     """
-    Reindexes `series` onto exact weekly-spaced timestamps from start_date
-    to end_date (inclusive of start, extending to cover end), using linear
-    interpolation for points that fall between the source series' native
-    granularity (Trends returns daily/weekly/monthly depending on range).
+    Reindexes `series` onto a new set of timestamps between start_date and
+    end_date, using linear interpolation for points that fall between the
+    source series' native granularity (Trends returns daily/weekly/monthly
+    depending on range).
+
+    Two modes, controlled by num_points:
+      - num_points is None (default): weekly-spaced timestamps, same as
+        this function's old fixed weekly-only behavior.
+      - num_points is an int: exactly that many timestamps, evenly spaced
+        in time between start_date and end_date (inclusive of both ends).
+        Useful when you want a specific point count for your geometry
+        (e.g. matching a particular helix/ribbon feature) regardless of
+        how that translates to a calendar interval.
     """
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
 
-    target_dates = []
-    d = start
-    while d <= end:
-        target_dates.append(d)
-        d = d + pd.DateOffset(weeks=1)
-    if target_dates[-1] < end:
-        target_dates.append(end)
-
-    target_index = pd.DatetimeIndex(target_dates)
+    if num_points is not None:
+        if num_points < 2:
+            raise ValueError("num_points must be at least 2.")
+        target_index = pd.date_range(start, end, periods=num_points)
+    else:
+        target_dates = []
+        d = start
+        while d <= end:
+            target_dates.append(d)
+            d = d + pd.DateOffset(weeks=1)
+        if target_dates[-1] < end:
+            target_dates.append(end)
+        target_index = pd.DatetimeIndex(target_dates)
 
     # combine source + target index so interpolation has real data to work from,
     # then pull out just the target points
@@ -287,8 +306,9 @@ def values_to_helix_coordinates(
     total_revolutions: float = 6.0,
 ) -> List[List[float]]:
     """
-    Converts a list of interest values (one per week, evenly spaced in
-    time) into [x, y, z] coordinates on a helix wrapped around a cylinder.
+    Converts a list of interest values (evenly spaced in time, whatever
+    their count) into [x, y, z] coordinates on a helix wrapped around a
+    cylinder.
 
     - The whole point set is spread over exactly `total_revolutions` full
       turns around the cylinder, from the first point (angle 0) to the
@@ -303,8 +323,7 @@ def values_to_helix_coordinates(
       dataset's own min/max range rather than assuming a fixed 0-100 scale
     - z runs evenly from 0 to cylinder_height across all points, regardless
       of how many points there are -- so the total height stays fixed even
-      though weekly sampling produces far more points than the old
-      bimonthly sampling did
+      as the point count changes
 
     Note: x and y here can still be negative (they're raw cos/sin values
     around the cylinder's centerline). See scale_xy_about_origin() below,
@@ -351,12 +370,11 @@ def smooth_radius_outliers(
     and even z-spacing along the helix are both preserved exactly.
 
     Outliers are detected using the standard IQR (interquartile range)
-    method: any
-    point whose distance from the origin (0, 0) in the x-y plane exceeds
-    Q3 + iqr_multiplier * (Q3 - Q1) (the standard IQR method) is treated as
-    an outlier. Averaging is always based on the ORIGINAL neighbor
-    positions (not other already-smoothed values), so two adjacent outliers
-    don't compound off each other.
+    method: any point whose distance from the origin (0, 0) in the x-y
+    plane exceeds Q3 + iqr_multiplier * (Q3 - Q1) is treated as an outlier.
+    Averaging is always based on the ORIGINAL neighbor positions (not other
+    already-smoothed values), so two adjacent outliers don't compound off
+    each other.
 
     The first and last points only have one neighbor (there's nothing
     before the first point or after the last), so those use that single
@@ -406,7 +424,6 @@ def smooth_radius_outliers(
     return smoothed
 
 
-
 def scale_xy_about_origin(
     coords: List[List[float]],
     max_abs: float = 15.0,
@@ -448,18 +465,19 @@ def trends_to_cylinder_helix(
     xy_max_abs: float = 15.0,
     iqr_multiplier: float = 1.5,
     total_revolutions: float = 6.0,
+    num_points: Optional[int] = None,
 ) -> str:
     """
     Full pipeline: words + date range -> Google Trends -> averaged series ->
-    resampled to weekly points -> helix coordinates -> x/y scaled about
-    the origin -> JSON string.
+    resampled to either weekly points or a fixed point count -> helix
+    coordinates -> x/y scaled about the origin -> JSON string.
 
     Returns a JSON string: a list of [x, y, z] lists.
     """
     raw_series = fetch_trends_series(words, start_date, end_date, geo=geo)
-    weekly = resample_weekly(raw_series, start_date, end_date)
+    resampled = resample_series(raw_series, start_date, end_date, num_points=num_points)
     coords = values_to_helix_coordinates(
-        weekly.tolist(), cylinder_height, cylinder_diameter, max_distance,
+        resampled.tolist(), cylinder_height, cylinder_diameter, max_distance,
         total_revolutions=total_revolutions
     )
     coords = smooth_radius_outliers(coords, iqr_multiplier=iqr_multiplier)
@@ -473,7 +491,7 @@ def trends_to_cylinder_helix(
 
 def _demo_with_mock_data():
     """
-    Exercises resample_weekly() and values_to_helix_coordinates() with a
+    Exercises resample_series() and values_to_helix_coordinates() with a
     synthetic trends-like series, so the geometry logic can be verified
     without hitting Google Trends. Useful for confirming your environment
     (pandas etc.) is set up correctly before trying a real fetch.
@@ -488,12 +506,17 @@ def _demo_with_mock_data():
     values = np.clip(values, 0, 100)
     mock_series = pd.Series(values, index=dates)
 
-    weekly = resample_weekly(mock_series, start_date, end_date)
-    print(f"[DEMO] Resampled to {len(weekly)} points, every week:")
+    # demo both modes: weekly, and a fixed point count
+    weekly = resample_series(mock_series, start_date, end_date)
+    print(f"[DEMO] Resampled to {len(weekly)} points, weekly:")
     print(weekly)
 
+    fixed_count = resample_series(mock_series, start_date, end_date, num_points=25)
+    print(f"\n[DEMO] Resampled to {len(fixed_count)} points, fixed count:")
+    print(fixed_count)
+
     coords = values_to_helix_coordinates(
-        weekly.tolist(),
+        fixed_count.tolist(),
         cylinder_height=100.0,
         cylinder_diameter=20.0,
         max_distance=15.0,
@@ -553,16 +576,21 @@ CSV_WORDS = None
 CSV_ANCHOR_RESCALE = False  # True only if combining >5-word compare files
                             # that share one repeated anchor word
 
-CYLINDER_HEIGHT = 82     # inches -- total height stays fixed regardless of point count
-CYLINDER_DIAMETER = 0
-MAX_DISTANCE = 15     # max radial bulge beyond the cylinder surface
-XY_MAX_ABS = 15.0   # farthest remaining point from (0, 0) in x-y is scaled to this distance
+CYLINDER_HEIGHT = 84    # inches -- total height stays fixed regardless of point count
+CYLINDER_DIAMETER = 12
+MAX_DISTANCE = 10     # max radial bulge beyond the cylinder surface
+XY_MAX_ABS = 10.0   # farthest remaining point from (0, 0) in x-y is scaled to this distance
 IQR_MULTIPLIER = 1.5   # outlier cutoff before scaling; lower = more aggressive smoothing
-TOTAL_REVOLUTIONS =30  # full turns spread evenly across ALL points, top to bottom --
+TOTAL_REVOLUTIONS = 6  # full turns spread evenly across ALL points, top to bottom --
                           # not tied to calendar time, just controls how tightly wound
                           # the spiral looks; raise for a tighter/denser wrap, lower for looser
 
-OUTPUT_FILE = "god_06_to_26.json"
+# Resampling: set NUM_POINTS to an integer for a fixed point count (evenly
+# spaced in time between START_DATE and END_DATE), or leave it as None to
+# fall back to the old weekly-spaced behavior.
+NUM_POINTS = 48   # e.g. 25 for exactly 25 points regardless of date range
+
+OUTPUT_FILE = "god_06_to_26_48_points_6_rev_12_dia.json"
 
 
 if __name__ == "__main__":
@@ -574,11 +602,11 @@ if __name__ == "__main__":
         print(f"Fetching Google Trends data live for: {WORDS}")
         print(f"Date range: {START_DATE} to {END_DATE}\n")
         raw_series = fetch_trends_series(WORDS, START_DATE, END_DATE)
-        weekly = resample_weekly(raw_series, START_DATE, END_DATE)
-        print(f"Resampled to {len(weekly)} points:")
-        print(weekly)
+        resampled = resample_series(raw_series, START_DATE, END_DATE, num_points=NUM_POINTS)
+        print(f"Resampled to {len(resampled)} points:")
+        print(resampled)
         coords = values_to_helix_coordinates(
-            weekly.tolist(), CYLINDER_HEIGHT, CYLINDER_DIAMETER, MAX_DISTANCE,
+            resampled.tolist(), CYLINDER_HEIGHT, CYLINDER_DIAMETER, MAX_DISTANCE,
             total_revolutions=TOTAL_REVOLUTIONS
         )
         coords = smooth_radius_outliers(coords, iqr_multiplier=IQR_MULTIPLIER)
@@ -588,11 +616,11 @@ if __name__ == "__main__":
         raw_series = load_trends_from_csv(
             CSV_PATHS, words=CSV_WORDS, anchor_rescale=CSV_ANCHOR_RESCALE
         )
-        weekly = resample_weekly(raw_series, START_DATE, END_DATE)
-        print(f"Resampled to {len(weekly)} points:")
-        print(weekly)
+        resampled = resample_series(raw_series, START_DATE, END_DATE, num_points=NUM_POINTS)
+        print(f"Resampled to {len(resampled)} points:")
+        print(resampled)
         coords = values_to_helix_coordinates(
-            weekly.tolist(), CYLINDER_HEIGHT, CYLINDER_DIAMETER, MAX_DISTANCE,
+            resampled.tolist(), CYLINDER_HEIGHT, CYLINDER_DIAMETER, MAX_DISTANCE,
             total_revolutions=TOTAL_REVOLUTIONS
         )
         coords = smooth_radius_outliers(coords, iqr_multiplier=IQR_MULTIPLIER)
